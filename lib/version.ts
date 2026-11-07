@@ -1,12 +1,12 @@
 /**
  * App version + about-page constants.
  *
- * The version is baked at build time from `package.json#version` into
- * the public env var NEXT_PUBLIC_APP_VERSION (see next.config.ts).
- * In dev / local installs the package.json version stays "0.0.0", so
- * the chip and welcome popup both render "v0.0.0" — only a CI build
- * triggered by a pushed git tag rewrites package.json to the real
- * release number ahead of `next build`.
+ * The version is baked at build time into the public env var
+ * NEXT_PUBLIC_APP_VERSION (see next.config.ts). In CI the release
+ * workflow rewrites `package.json#version` from the pushed git tag; in a
+ * working checkout it stays "0.0.0", so scripts/app-version.cjs falls
+ * back to `git describe` and both the chip and the packaged app report
+ * the nearest release tag instead of v0.0.0.
  */
 
 export const APP_VERSION = process.env.NEXT_PUBLIC_APP_VERSION ?? "0.0.0";

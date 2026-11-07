@@ -22,6 +22,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveAppVersion } from "./app-version.cjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
@@ -187,6 +188,14 @@ async function buildOne(targetKey) {
     console.log(`    signing: ${describeMacSigningMode(signing.mode)}`);
   }
 
+  // package.json#version is only rewritten from the tag by the release
+  // workflow, so a local checkout still says 0.0.0. Stamp the resolved
+  // version into the packaged app instead: extraMetadata flows into the
+  // bundled package.json (what app.getVersion() reads), the installer
+  // metadata and the artefact filename.
+  const appVersion = resolveAppVersion();
+  console.log(`    version: ${appVersion}`);
+
   await run(
     "npx",
     [
@@ -195,6 +204,7 @@ async function buildOne(targetKey) {
       ...t.builderFlag,
       "--publish",
       "never",
+      `--config.extraMetadata.version=${appVersion}`,
       ...signing.extraArgs,
     ],
     { env: { ...process.env, ...signing.extraEnv } },
