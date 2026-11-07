@@ -15,6 +15,11 @@
  *   Linux x64   → *.AppImage
  *
  * Robustness:
+ *   • "Later" is remembered per release (userData/update-state.json),
+ *     so the modal appears once per version instead of on every launch.
+ *   • A build reporting version 0.0.0 was never stamped with a release
+ *     version; the check is skipped rather than treating every release
+ *     as newer.
  *   • Network failure → silently skip the check (the user sees the
  *     wizard / app as if no update existed).
  *   • Missing matching asset → skip too (a release that doesn't
@@ -142,6 +147,33 @@ function pickAsset(assets) {
 // ── Window + state ─────────────────────────────────────────────────────
 let updateWindow = null;
 let pending = null;
+
+// A version the user already said "Later" to. Persisted so the prompt
+// fires once per release instead of on every launch; a strictly newer
+// release still prompts.
+function updateStateFile() {
+  return path.join(app.getPath("userData"), "update-state.json");
+}
+
+function readUpdateState() {
+  try {
+    const raw = fs.readFileSync(updateStateFile(), "utf-8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeUpdateState(next) {
+  try {
+    const file = updateStateFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(next, null, 2));
+  } catch {
+    // Losing the skip marker only means one extra prompt; never fail boot.
+  }
+}
 
 async function checkOnceForUpdate() {
   try {
@@ -297,19 +329,64 @@ function showUpdateWindow() {
   });
 }
 
-// ── Public: run before everything else ──────────────────────────────────
-//
-// Returns true if the user kicked off an update (app is quitting), false
-// if they declined or there was no update. The caller MUST short-circuit
-// the rest of startup when this returns true.
-async function maybeRunUpdate() {
-  // Bypass for explicit opt-out (testing / corporate networks).
+// ── Public API ──────────────────────────────────────────────────────────
+
+function isCheckEnabled() {
+  // Explicit opt-out (testing / corporate networks).
   if (process.env.GETIT_SKIP_UPDATE === "1") return false;
+  // A build that never had a version stamped (a working checkout builds
+  // with package.json#version still at 0.0.0) has nothing meaningful to
+  // compare against: every published release looks newer, so the prompt
+  // would fire on every launch for a build the user cannot upgrade from
+  // this dialog anyway.
+  return app.getVersion() !== "0.0.0";
+}
+
+/**
+ * Starts the GitHub check without showing anything, so the caller can
+ * overlap the network round-trip with slower boot work (the embedded
+ * server takes seconds). Resolves to null when the check is disabled or
+ * no actionable release exists. Pass the promise to maybeRunUpdate().
+ */
+function prefetchUpdate() {
+  if (!isCheckEnabled()) return Promise.resolve(null);
+  return checkOnceForUpdate();
+}
+
+/**
+ * Shows the update prompt for an already-running (or fresh) check.
+ *
+ * Returns true if the user kicked off an update (app is quitting), false
+ * if they declined or there was no update. The caller MUST short-circuit
+ * the rest of startup when this returns true.
+ */
+async function maybeRunUpdate(prefetched) {
+  if (!isCheckEnabled()) return false;
+
   ensureIpc();
-  pending = await checkOnceForUpdate();
+  pending = await (prefetched || checkOnceForUpdate());
   if (!pending) return false;
+
+  const latestVersion = pending.latestVersion;
+  const state = readUpdateState();
+  if (
+    state.skippedVersion &&
+    compareVersions(latestVersion, state.skippedVersion) <= 0
+  ) {
+    pending = null;
+    return false;
+  }
+
   try {
-    return await showUpdateWindow();
+    const didUpdate = await showUpdateWindow();
+    if (!didUpdate) {
+      writeUpdateState({
+        ...state,
+        skippedVersion: latestVersion,
+        skippedAt: new Date().toISOString(),
+      });
+    }
+    return didUpdate;
   } catch {
     return false;
   } finally {
@@ -317,7 +394,7 @@ async function maybeRunUpdate() {
   }
 }
 
-module.exports = { maybeRunUpdate };
+module.exports = { maybeRunUpdate, prefetchUpdate };
 
 // Silence unused-var linting for dialog import (kept available in case
 // we want to surface a download-failed native alert in the future).
