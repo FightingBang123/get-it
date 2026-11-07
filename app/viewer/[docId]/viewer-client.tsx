@@ -286,7 +286,7 @@ export default function ViewerClient({ docId }: { docId: string }) {
 
   const docTitle = useMemo(
     () =>
-      meta && (FILENAME_TO_TITLE[meta.filename] || meta.filename.replace(/\.(pdf|md|markdown|mdown|mkd|mdwn)$/i, "")),
+      meta && (FILENAME_TO_TITLE[meta.filename] || meta.filename.replace(/\.(pdf|epub|md|markdown|mdown|mkd|mdwn)$/i, "")),
     [meta],
   );
 

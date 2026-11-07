@@ -83,9 +83,9 @@ const FILENAME_TO_TITLE: Record<string, string> = {
   "chemistry.pdf": "Organic Chemistry",
 };
 
-/** A PDF, or a Markdown file we render to PDF on upload. Kept in sync with
- *  MARKDOWN_EXT in app/api/upload/route.ts. */
-const ACCEPTED_FILE = /\.(pdf|md|markdown|mdown|mkd|mdwn)$/i;
+/** A PDF, or a Markdown/EPUB file we render to PDF on upload. Kept in sync
+ *  with MARKDOWN_EXT and EPUB_EXT in app/api/upload/route.ts. */
+const ACCEPTED_FILE = /\.(pdf|epub|md|markdown|mdown|mkd|mdwn)$/i;
 
 function humaniseAgo(ts: number): string {
   const dt = Date.now() - ts;
@@ -144,7 +144,7 @@ export default function UploadCard() {
     async (file: File) => {
       setError(null);
       if (!ACCEPTED_FILE.test(file.name)) {
-        setError("Please pick a PDF or Markdown (.md) file");
+        setError("Please pick a PDF, EPUB, or Markdown (.md) file");
         return;
       }
       setBusy("upload");
@@ -176,7 +176,7 @@ export default function UploadCard() {
       </h1>
 
       <p className="mt-7 max-w-2xl text-[15px] leading-[1.65] text-[var(--ink-700)]">
-        Drop a PDF. Its hardest concepts come alive inline as you read.
+        Drop a PDF or an EPUB. Its hardest concepts come alive inline as you read.
         Chat with it, drill yourself, explain it back to a curious
         eight-year-old. Watch a map of what you actually understand
         grow, concept by concept, not page by page.
@@ -210,7 +210,7 @@ export default function UploadCard() {
         <input
           ref={inputRef}
           type="file"
-          accept="application/pdf,.pdf,text/markdown,.md,.markdown"
+          accept="application/pdf,.pdf,application/epub+zip,.epub,text/markdown,.md,.markdown"
           className="hidden"
           onChange={(e) => {
             const f = e.target.files?.[0];
@@ -244,7 +244,7 @@ export default function UploadCard() {
             </>
           ) : (
             <>
-              <span>Drop your PDF or Markdown here, or</span>
+              <span>Drop your PDF, EPUB, or Markdown here, or</span>
               <span className="inline-flex items-center gap-1.5 rounded-md bg-[var(--accent-600)] px-3 py-1 text-[12.5px] font-semibold text-white shadow-sm transition hover:bg-[var(--accent-700)]">
                 <Upload className="h-3.5 w-3.5" />
                 Select the file
@@ -253,7 +253,7 @@ export default function UploadCard() {
           )}
         </p>
         <p className="mt-3 text-[11.5px] text-[var(--ink-400)]">
-          Text-based PDFs and Markdown (.md) work best. No OCR.
+          Text-based PDFs, EPUB books, and Markdown (.md) work best. No OCR or DRM.
         </p>
       </div>
 
@@ -308,7 +308,7 @@ export default function UploadCard() {
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             {libraryPreview.map((d) => {
               const title =
-                FILENAME_TO_TITLE[d.filename] ?? d.filename.replace(/\.(pdf|md|markdown|mdown|mkd|mdwn)$/i, "");
+                FILENAME_TO_TITLE[d.filename] ?? d.filename.replace(/\.(pdf|epub|md|markdown|mdown|mkd|mdwn)$/i, "");
               return (
                 <Link
                   key={d.id}

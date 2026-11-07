@@ -83,8 +83,12 @@ const LATIN_FONTS: Fonts = {
 };
 
 /** Matches CJK ideographs, kana, hangul, and CJK/fullwidth punctuation. */
-const CJK_RE =
+export const CJK_RE =
   /[　-ヿ㐀-䶿一-鿿豈-﫿＀-￯가-힯]/;
+
+/** Tallest a figure may be drawn, in PDF points. Keeps one image from
+ *  swallowing a whole page while still giving artwork room to breathe. */
+const MAX_IMAGE_HEIGHT = 380;
 
 /** Point size per heading depth (h1…h6). */
 const HEADING_SIZE = [22, 17, 14, 12.5, 11.5, 11];
@@ -95,7 +99,14 @@ const LINE_GAP = 2.5;
 type PDFKitDoc = InstanceType<typeof PDFDocument>;
 
 /** Render context threaded through every block renderer. */
-type Ctx = { doc: PDFKitDoc; fonts: Fonts };
+type Ctx = {
+  doc: PDFKitDoc;
+  fonts: Fonts;
+  /** Resolves an image `src` from the Markdown to bytes, or null to fall back
+   *  to the alt text. The EPUB importer uses this to pull pictures straight
+   *  out of the archive. */
+  resolveImage?: (src: string) => Buffer | null;
+};
 
 /** Inline run after emphasis/link nesting has been flattened to leaves. */
 type Segment = {
@@ -332,7 +343,92 @@ function renderHeading(ctx: Ctx, token: Tokens.Heading): void {
   doc.moveDown(0.25);
 }
 
+/** If a paragraph carries exactly one image and no other text, return it.
+ *  That is how a standalone figure arrives after Markdown conversion. */
+function soleImage(tokens: Token[] | undefined): Tokens.Image | null {
+  if (!tokens) return null;
+  let image: Tokens.Image | null = null;
+  let textLength = 0;
+  const walk = (list: Token[]) => {
+    for (const token of list) {
+      if (token.type === "image") {
+        if (image) textLength += 1; // a second image disqualifies the block
+        image = token as Tokens.Image;
+      } else if ((token as Tokens.Text).tokens) {
+        walk((token as Tokens.Text).tokens as Token[]);
+      } else {
+        textLength += ((token as { text?: string }).text ?? "").trim().length;
+      }
+    }
+  };
+  walk(tokens);
+  return image && textLength === 0 ? image : null;
+}
+
+function renderImage(ctx: Ctx, src: string, alt: string): void {
+  const { doc, fonts } = ctx;
+  const bytes = ctx.resolveImage?.(src) ?? null;
+
+  let width = 0;
+  let height = 0;
+  if (bytes) {
+    try {
+      const opened = (
+        doc as unknown as {
+          openImage(b: Buffer): { width: number; height: number };
+        }
+      ).openImage(bytes);
+      width = opened.width;
+      height = opened.height;
+    } catch {
+      width = 0;
+    }
+  }
+
+  if (bytes && width > 0 && height > 0) {
+    const scale = Math.min(CONTENT_WIDTH / width, MAX_IMAGE_HEIGHT / height, 1);
+    const drawWidth = width * scale;
+    const drawHeight = height * scale;
+    breakIfTight(doc, drawHeight + 10);
+    const x = MARGIN + (CONTENT_WIDTH - drawWidth) / 2;
+    const y = doc.y;
+    try {
+      doc.image(bytes, x, y, { width: drawWidth, height: drawHeight });
+      doc.x = MARGIN;
+      doc.y = y + drawHeight;
+      if (alt.trim()) {
+        doc
+          .font(fonts.italic)
+          .fontSize(9)
+          .fillColor(INK_500)
+          .text(alt.trim(), MARGIN, doc.y + 4, {
+            width: CONTENT_WIDTH,
+            align: "center",
+          });
+      }
+      doc.moveDown(0.6);
+      return;
+    } catch {
+      doc.x = MARGIN;
+      // fall through to the alt-text rendering below
+    }
+  }
+
+  if (alt.trim()) {
+    emitSegments(
+      ctx,
+      [{ text: alt.trim(), bold: false, italic: true, mono: false }],
+      { size: BODY_SIZE, color: INK_500, paragraphGap: 8 },
+    );
+  }
+}
+
 function renderParagraph(ctx: Ctx, token: Tokens.Paragraph): void {
+  const image = soleImage(token.tokens);
+  if (image) {
+    renderImage(ctx, image.href, image.text ?? "");
+    return;
+  }
   const segs: Segment[] = [];
   flattenInline(token.tokens, BASE_STYLE, segs);
   emitSegments(ctx, segs, { size: BODY_SIZE, color: INK_700, paragraphGap: 8 });
@@ -516,11 +612,25 @@ function renderBlock(ctx: Ctx, token: Token): void {
   }
 }
 
+export type MarkdownPdfOptions = {
+  /** Stamped into the PDF `Info` dictionary. */
+  producer?: string;
+  /**
+   * Resolve an image reference to raw JPEG/PNG bytes. Returning null (or a
+   * format pdfkit cannot draw, e.g. SVG) falls back to the alt text, so a
+   * broken picture never fails the whole document.
+   */
+  resolveImage?: (src: string) => Buffer | null;
+};
+
 /**
  * Render a Markdown string to PDF bytes. The returned buffer is a normal,
  * text-bearing PDF that `extractPdf` reads exactly like any other upload.
  */
-export async function markdownToPdf(markdown: string): Promise<Buffer> {
+export async function markdownToPdf(
+  markdown: string,
+  opts: MarkdownPdfOptions = {},
+): Promise<Buffer> {
   if (Buffer.byteLength(markdown, "utf-8") > MAX_MARKDOWN_BYTES) {
     throw new MarkdownTooLargeError();
   }
@@ -533,7 +643,7 @@ export async function markdownToPdf(markdown: string): Promise<Buffer> {
   const doc = new PDFDocument({
     size: "A4",
     margins: { top: MARGIN, bottom: MARGIN, left: MARGIN, right: MARGIN },
-    info: { Producer: "Get It. Markdown Importer" },
+    info: { Producer: opts.producer ?? "Get It. Markdown Importer" },
     bufferPages: true,
     pdfVersion: "1.7",
     lang: "en-US",
@@ -546,7 +656,11 @@ export async function markdownToPdf(markdown: string): Promise<Buffer> {
     doc.on("error", reject);
   });
 
-  const ctx: Ctx = { doc, fonts: setUpFonts(doc, markdown) };
+  const ctx: Ctx = {
+    doc,
+    fonts: setUpFonts(doc, markdown),
+    resolveImage: opts.resolveImage,
+  };
 
   doc.x = MARGIN;
   for (const token of tokens) renderBlock(ctx, token);
