@@ -68,16 +68,6 @@ const {
 const { maybeRunUpdate, prefetchUpdate } = require("./updater");
 const analytics = require("./analytics");
 
-// ── Single-instance lock ────────────────────────────────────────────────
-// If the user double-clicks the app icon a second time, focus the existing
-// window rather than spawning a second Next server (port conflict + KG
-// races on the same data dir).
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-  return;
-}
-
 // ── Data dir resolution ─────────────────────────────────────────────────
 // `app.getPath('userData')` defaults to:
 //   macOS:  ~/Library/Application Support/<productName>
@@ -95,6 +85,21 @@ const DATA_DIR = path.join(ELECTRON_USER_DATA_PARENT, "get-it");
 app.setPath("userData", DATA_DIR);
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(path.join(DATA_DIR, "logs"), { recursive: true });
+
+// ── Single-instance lock ────────────────────────────────────────────────
+// If the user double-clicks the app icon a second time, focus the existing
+// window rather than spawning a second Next server (port conflict + KG
+// races on the same data dir).
+//
+// This runs AFTER the userData path is settled: Electron places the lock file
+// (and Chromium's own `Local State`) under userData, so requesting the lock
+// earlier left a stray `%APPDATA%\Get It` directory behind while every real
+// data file lived in `%APPDATA%\get-it`.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+  return;
+}
 
 // ── Resolve the Next.js standalone server entry ─────────────────────────
 // In `electron .` dev mode the user runs `npm run dev:hmr` which
