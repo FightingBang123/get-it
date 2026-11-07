@@ -14,6 +14,12 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     "electron/*-bin/**",
     "electron/assets/**",
+    // Packaged desktop build output (`npm run build:desktop` /
+    // scripts/build-electron.mjs). It embeds the whole Next standalone tree
+    // plus the vendored Gemini/Pi CLI bundles — hundreds of MB of JS. It was
+    // the one build output not ignored here, so a full `npm run lint` after a
+    // desktop build walked all of it and died at the default 4 GB heap.
+    "dist-electron/**",
     "public/pdf.worker.min.mjs",
   ]),
   {
