@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:;"
+    />
+    <title>Get It.</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --ink-900: #111113;
+        --ink-500: #5a5a66;
+        --ink-300: #c6c6cf;
+        --accent-600: #3b5be0;
+      }
+      /* The dark palette is injected by main.js via webContents.insertCSS
+         before the window is shown — the page itself runs no script. */
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--ink-900);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter,
+          system-ui, sans-serif;
+        -webkit-user-select: none;
+        user-select: none;
+        cursor: default;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        padding: 28px;
+      }
+      .wordmark {
+        font-size: 26px;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+        line-height: 1;
+      }
+      .wordmark span { color: var(--accent-600); }
+      .status {
+        font-size: 12.5px;
+        color: var(--ink-500);
+        letter-spacing: 0.01em;
+      }
+      .track {
+        width: 180px;
+        height: 3px;
+        border-radius: 999px;
+        background: var(--ink-300);
+        overflow: hidden;
+        position: relative;
+      }
+      .track > i {
+        position: absolute;
+        inset: 0 auto 0 0;
+        width: 40%;
+        border-radius: 999px;
+        background: var(--accent-600);
+        animation: slide 1.15s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+      }
+      @keyframes slide {
+        0%   { transform: translateX(-100%); }
+        100% { transform: translateX(350%); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .track > i { animation: none; width: 100%; opacity: 0.5; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wordmark">Get It<span>.</span></div>
+    <div class="track"><i></i></div>
+    <div class="status">Starting your workspace…</div>
+  </body>
+</html>

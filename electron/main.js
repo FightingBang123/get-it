@@ -65,7 +65,7 @@ const {
   refreshCodexStatus,
   onCodexStatusChange,
 } = require("./setup");
-const { maybeRunUpdate } = require("./updater");
+const { maybeRunUpdate, prefetchUpdate } = require("./updater");
 const analytics = require("./analytics");
 
 // ── Single-instance lock ────────────────────────────────────────────────
@@ -333,10 +333,72 @@ const CHROME = {
   light: { bg: "#ffffff", overlayBg: "#ffffff", overlaySymbol: "#111113" },
 };
 
+// ── Splash ──────────────────────────────────────────────────────────────
+// Nothing is on screen until the embedded server answers AND the renderer
+// has painted — several seconds on a cold start. A tiny frameless window
+// closes that gap: created synchronously at whenReady, torn down as soon
+// as another window is about to be shown.
+let splashWindow = null;
+let mainWindowPending = false;
+
+function showSplash() {
+  const chrome = prefersDarkChrome() ? CHROME.dark : CHROME.light;
+  splashWindow = new BrowserWindow({
+    width: 380,
+    height: 220,
+    frame: false,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    backgroundColor: chrome.bg,
+    show: false,
+    webPreferences: {
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+    },
+  });
+  splashWindow.removeMenu?.();
+
+  // The page carries no script (CSP default-src 'none'), so the dark
+  // palette is pushed in as CSS before the first paint.
+  splashWindow.webContents.once("dom-ready", () => {
+    if (!prefersDarkChrome()) return;
+    splashWindow?.webContents.insertCSS(
+      ":root{--bg:#111113;--ink-900:#f4f4f5;--ink-500:#9a9aa6;--ink-300:#3a3a42;--accent-600:#6f8dff}",
+    );
+  });
+
+  splashWindow.loadFile(path.join(__dirname, "splash.html"));
+  splashWindow.once("ready-to-show", () => {
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.show();
+  });
+  splashWindow.on("closed", () => {
+    splashWindow = null;
+  });
+}
+
+function closeSplash() {
+  const w = splashWindow;
+  splashWindow = null;
+  if (w && !w.isDestroyed()) w.destroy();
+}
+
+// Any window other than the splash (setup wizard, update prompt) means the
+// user now has real UI to look at, so drop the splash rather than leaving
+// it behind them. The main window is exempt: it is created hidden and
+// closes the splash itself once it has painted.
+app.on("browser-window-created", (_event, win) => {
+  if (win === splashWindow || mainWindowPending) return;
+  closeSplash();
+});
+
 function createMainWindow() {
   const isMac = process.platform === "darwin";
   const isWin = process.platform === "win32";
   const chrome = prefersDarkChrome() ? CHROME.dark : CHROME.light;
+  mainWindowPending = true;
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
@@ -374,6 +436,8 @@ function createMainWindow() {
   });
 
   mainWindow.once("ready-to-show", () => {
+    mainWindowPending = false;
+    closeSplash();
     mainWindow?.show();
   });
 
@@ -449,12 +513,34 @@ function focusMainWindow() {
 let bootstrapping = true;
 
 app.whenReady().then(async () => {
+  // Paint something before the first await: everything below this line
+  // used to happen on a blank screen.
+  showSplash();
+
   try {
-    // Update check runs BEFORE anything else — the wizard, the embedded
-    // server, the main window. If the user accepts the update, we quit
-    // here (the new installer takes over). Otherwise we proceed with
-    // the normal boot sequence.
-    const userKickedOffUpdate = await maybeRunUpdate();
+    // Start the GitHub release check now and let it run underneath the
+    // provider check and the server boot. It used to sit serially in
+    // front of both, putting a network round-trip on every cold start.
+    const updateCheck = prefetchUpdate();
+
+    // The provider check can spawn a CLI and the Next server takes
+    // seconds to answer; they are independent, so overlap them. Any
+    // setup wizard that opens closes the splash on creation.
+    const serverReady = startEmbeddedServer();
+    // Avoid an unhandled rejection when we bail out before awaiting it.
+    serverReady.catch(() => {});
+
+    const ok = await ensureProviderReady();
+    if (!ok) {
+      app.quit();
+      return;
+    }
+    await serverReady;
+
+    // Block on the update decision only now — the network call has had
+    // the whole provider + server boot to complete. If the user accepts
+    // the update, we quit here and the new installer takes over.
+    const userKickedOffUpdate = await maybeRunUpdate(updateCheck);
     if (userKickedOffUpdate) {
       // updater.js calls app.quit() on its own; just bail out. The "update"
       // analytics event is fired from the updater itself, so we don't also
@@ -467,18 +553,11 @@ app.whenReady().then(async () => {
     // the app for use. Powers Total/Daily/Weekly/Monthly users.
     analytics.trackOpen();
 
-    // Run the provider setup/wizard. We can't start the Next server without
-    // the AI backend — the agents would crash on the first request.
-    const ok = await ensureProviderReady();
-    if (!ok) {
-      app.quit();
-      return;
-    }
-    await startEmbeddedServer();
     createMainWindow();
     bootstrapping = false;
   } catch (err) {
     bootstrapping = false;
+    closeSplash();
     dialog.showErrorBox(
       "Get It. — failed to start",
       String(err && err.message ? err.message : err),
