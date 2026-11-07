@@ -1,11 +1,9 @@
-import { execFile, type ChildProcess } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import { loadSettings } from "./settings-store";
 import { CodexError } from "./codex-errors";
 import { resolveBundledBinary } from "./providers/cli-runner";
-
-const execFileAsync = promisify(execFile);
 
 export type RunOptions = {
   signal?: AbortSignal;
@@ -73,15 +71,15 @@ function getPiExecutionConfig(): { binary: string; preArgs: string[] } {
 function buildEnvAndProvider(settings: ReturnType<typeof loadSettings>): { env: NodeJS.ProcessEnv; provider: string } {
   const env = { ...process.env };
   let provider = "openai";
-  
+
   // Configure Pi to use the provided BYOK settings via a dynamic models.json config
   if (settings.piUrl) {
     const agentDir = path.join(DATA_DIR, "pi-agent");
     fs.mkdirSync(agentDir, { recursive: true });
-    
+
     provider = "getit_byok";
     const apiType = settings.piApiType || "openai-completions";
-    
+
     // Set appropriate API Key in environment variables based on API Protocol
     if (settings.piApiKey) {
       if (apiType === "google-generative-ai") {
@@ -111,7 +109,7 @@ function buildEnvAndProvider(settings: ReturnType<typeof loadSettings>): { env: 
   } else if (settings.piApiKey) {
     env.OPENAI_API_KEY = settings.piApiKey;
   }
-  
+
   // Set offline/telemetry rules for hermetic execution
   env.PI_OFFLINE = "1";
   env.PI_TELEMETRY = "0";
@@ -156,104 +154,372 @@ type PiEvent = {
   messages?: PiMessage[];
 };
 
-function parsePiNdjson<T>(stdout: string): { data: T; usage: unknown } {
-  const lines = stdout.split('\n').filter(l => l.trim().length > 0);
-  let assistantText = "";
-  let usage: unknown = null;
-  let errorMessage = "";
+/**
+ * Bounded retention for the non-NDJSON fallback path. The happy path never
+ * reads `rawStdout`; only a genuine non-NDJSON stdout does, and a response
+ * larger than this cap could not be parsed as one JSON object anyway — so
+ * keeping more would only waste memory.
+ */
+const RAW_OUTPUT_CAP = 1 * 1024 * 1024;
+/** Keep the most recent stderr bytes — the newest lines carry the cause. */
+const STDERR_CAP = 8 * 1024;
 
-  for (const line of lines) {
+type PiCollectResult = {
+  assistantText: string;
+  usage: unknown;
+  errorMessage: string;
+  rawStdout: string;
+  stderr: string;
+  exitCode: number | null;
+  spawnError: Error | null;
+  aborted: boolean;
+  rawTruncated: boolean;
+};
+
+/**
+ * Kill a Pi child on abort. `execFile` used to do this for us via its `signal`
+ * option; with `spawn` we have to do it ourselves. Mirrors
+ * lib/providers/cli-runner.ts:197-213.
+ */
+function killPiChild(child: ChildProcess): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const pid = child.pid;
+  try {
+    if (process.platform === "win32" && typeof pid === "number") {
+      spawnSync("taskkill", ["/pid", String(pid), "/f", "/t"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } else {
+      // The child is non-detached (it shares the server's process group), so
+      // kill it directly — a negative-pid group kill would hit the server.
+      child.kill("SIGKILL");
+    }
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
+ * Run Pi in `--mode json` and consume its NDJSON stdout incrementally.
+ *
+ * Why not `execFile`: Pi writes one JSON line per session event, and its
+ * `message_update` event carries the FULL accumulated assistant message on
+ * every streaming chunk (see @earendil-works/pi-agent-core types, and
+ * pi-coding-agent/dist/modes/print-mode.js which stringifies each event). The
+ * total stdout therefore grows QUADRATICALLY with response length, so any
+ * fixed `maxBuffer` is eventually exceeded — the failure surfaced as
+ * "stdout maxBuffer length exceeded". Streaming means we hold only the final
+ * assistant text and usage, regardless of how much Pi emits.
+ *
+ * Only two event types are ever consumed (`agent_end` / `message_end`), so the
+ * delta flood is skipped entirely — it carries nothing we read.
+ */
+function spawnAndCollect(
+  label: "runJson" | "runJsonInThread",
+  binary: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<PiCollectResult> {
+  return new Promise((resolve) => {
+    const startTime = Date.now();
+    console.log(`\x1b[35m[Pi Telemetry] [${label}] Starting child process...\x1b[0m`);
+
+    let child: ChildProcess;
     try {
-      const event = JSON.parse(line) as PiEvent;
+      child = spawn(binary, args, {
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+        // NOT detached: the child must stay in the server's process group so the
+        // Electron main's group tree-kill (and the watchdog) reap it on shutdown.
+        // Detaching would make it its own group leader and orphan in-flight
+        // calls when the app quits.
+      });
+    } catch (err) {
+      resolve({
+        assistantText: "",
+        usage: null,
+        errorMessage: "",
+        rawStdout: "",
+        stderr: "",
+        exitCode: null,
+        spawnError: err instanceof Error ? err : new Error(String(err)),
+        aborted: false,
+        rawTruncated: false,
+      });
+      return;
+    }
+
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+
+    let stdoutBuf = "";
+    let stderrBuf = "";
+    let rawStdout = "";
+    let rawTruncated = false;
+    let stderr = "";
+    let assistantText = "";
+    let usage: unknown = null;
+    let errorMessage = "";
+    let spawnError: Error | null = null;
+    let aborted = false;
+    let settled = false;
+    let firstTokenTime: number | null = null;
+
+    const markFirstToken = () => {
+      if (firstTokenTime !== null) return;
+      firstTokenTime = Date.now();
+      console.log(
+        `\x1b[32m[Pi Telemetry] [${label}] Time to First Token (TTFT): ${firstTokenTime - startTime}ms\x1b[0m`,
+      );
+    };
+
+    const appendRaw = (s: string) => {
+      const room = RAW_OUTPUT_CAP - rawStdout.length;
+      if (room <= 0) {
+        rawTruncated = true;
+        return;
+      }
+      if (s.length <= room) {
+        rawStdout += s;
+      } else {
+        rawStdout += s.slice(0, room);
+        rawTruncated = true;
+      }
+    };
+
+    const handleEvent = (event: PiEvent) => {
+      // TTFT is reported for the first event carrying assistant content — the
+      // session header and other lifecycle events arrive earlier and are not
+      // the first token.
+      if (event.message?.content) markFirstToken();
+
+      if (event.type) {
+        console.log(`\x1b[36m[Pi Event] [${label}] ${event.type}\x1b[0m`);
+      }
+
       if (event.errorMessage) {
         errorMessage = event.errorMessage;
       }
       if (event.message?.errorMessage) {
         errorMessage = event.message.errorMessage;
       }
+      if (event.errorMessage || event.message?.errorMessage) {
+        console.error(
+          `\x1b[31m[Pi Coder ERROR] [${label}] ${event.errorMessage || event.message?.errorMessage}\x1b[0m`,
+        );
+      }
 
       if (event.type === "agent_end" && event.messages) {
-         const lastMsg = event.messages[event.messages.length - 1];
-         if (lastMsg?.role === "assistant") {
-            const textContent = lastMsg.content?.find((c) => c.type === "text")?.text;
-            if (textContent) assistantText = textContent;
-            if (lastMsg.usage) usage = lastMsg.usage;
-         }
+        const lastMsg = event.messages[event.messages.length - 1];
+        if (lastMsg?.role === "assistant") {
+          const textContent = lastMsg.content?.find((c) => c.type === "text")?.text;
+          if (textContent) assistantText = textContent;
+          if (lastMsg.usage) usage = lastMsg.usage;
+        }
       } else if (event.type === "message_end" && event.message?.role === "assistant") {
-         const textContent = event.message.content?.find((c) => c.type === "text")?.text;
-         if (textContent) assistantText = textContent;
-         if (event.message.usage) usage = event.message.usage;
+        const textContent = event.message.content?.find((c) => c.type === "text")?.text;
+        if (textContent) assistantText = textContent;
+        if (event.message.usage) usage = event.message.usage;
       }
-    } catch {
-      // ignore non-json lines
+    };
+
+    const handleLine = (rawLine: string) => {
+      const line = rawLine.trim();
+      if (!line) return;
+
+      // Fast-skip the streaming-delta flood. `message_update` re-serialises the
+      // whole accumulated message on every chunk, so it dominates stdout volume
+      // while carrying nothing handleEvent reads. This is a fail-safe
+      // optimisation: we do not depend on key ordering, and if the prefix ever
+      // misses we fall through to a normal parse that ignores the event anyway.
+      // It only skips the JSON.parse cost, never correctness.
+      if (line.startsWith('{"type":"message_update"')) {
+        markFirstToken();
+        return;
+      }
+
+      let event: PiEvent;
+      try {
+        event = JSON.parse(line) as PiEvent;
+      } catch {
+        // Not JSON, log as raw text.
+        console.log(`[Pi Raw stdout] [${label}] ${line}`);
+        return;
+      }
+      handleEvent(event);
+    };
+
+    /** Boundary-safe drain: a line split across chunks is reassembled. */
+    const flushLines = (chunk: string) => {
+      stdoutBuf += chunk;
+      let nl: number;
+      while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
+        const line = stdoutBuf.slice(0, nl);
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        handleLine(line);
+      }
+    };
+
+    const finalizeBuf = () => {
+      const tailOut = stdoutDecoder.end();
+      if (tailOut) {
+        appendRaw(tailOut);
+        flushLines(tailOut);
+      }
+      const tailErr = stderrDecoder.end();
+      if (tailErr) {
+        stderr = (stderr + tailErr).slice(-STDERR_CAP);
+        stderrBuf += tailErr;
+      }
+      // A final line can arrive without a trailing newline.
+      if (stdoutBuf) {
+        const last = stdoutBuf;
+        stdoutBuf = "";
+        handleLine(last);
+      }
+      if (stderrBuf.trim()) {
+        for (const line of stderrBuf.split("\n")) {
+          if (line.trim()) console.error(`\x1b[33m[Pi stderr] [${label}] ${line}\x1b[0m`);
+        }
+      }
+      stderrBuf = "";
+    };
+
+    const onAbort = () => {
+      aborted = true;
+      killPiChild(child);
+    };
+
+    const done = (exitCode: number | null) => {
+      if (settled) return;
+      settled = true;
+      // `once: true` only auto-removes when the listener FIRES; remove it here
+      // too so a normally-completed call doesn't leak a listener while
+      // codex.ts's 5-minute linkAbort timer is still pending.
+      signal?.removeEventListener("abort", onAbort);
+      finalizeBuf();
+      if (rawTruncated) {
+        console.warn(
+          `\x1b[33m[Pi Telemetry] [${label}] stdout exceeded the ${RAW_OUTPUT_CAP}-byte raw-retention cap; kept the prefix only.\x1b[0m`,
+        );
+      }
+      console.log(
+        `\x1b[35m[Pi Telemetry] [${label}] Process exited with code ${exitCode}. Total duration: ${Date.now() - startTime}ms\x1b[0m`,
+      );
+      resolve({
+        assistantText,
+        usage,
+        errorMessage,
+        rawStdout,
+        stderr,
+        exitCode,
+        spawnError,
+        aborted,
+        rawTruncated,
+      });
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      const s = stdoutDecoder.write(chunk);
+      if (!s) return;
+      appendRaw(s);
+      flushLines(s);
+    });
+    child.stdout?.on("error", () => {});
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      const s = stderrDecoder.write(chunk);
+      if (!s) return;
+      stderr = (stderr + s).slice(-STDERR_CAP);
+      stderrBuf += s;
+      let nl: number;
+      while ((nl = stderrBuf.indexOf("\n")) >= 0) {
+        const line = stderrBuf.slice(0, nl);
+        stderrBuf = stderrBuf.slice(nl + 1);
+        if (line.trim()) console.error(`\x1b[33m[Pi stderr] [${label}] ${line}\x1b[0m`);
+      }
+    });
+    child.stderr?.on("error", () => {});
+
+    // `close` (not `exit`) so every stdout byte has been read before we settle.
+    child.once("error", (err: Error) => {
+      spawnError = err;
+      done(null);
+    });
+    child.once("close", (code: number | null) => done(code));
+
+    if (signal) {
+      if (signal.aborted) {
+        aborted = true;
+        killPiChild(child);
+      } else {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
     }
-  }
 
-  if (errorMessage && !assistantText) {
-     throw new Error(errorMessage);
-  }
-
-  if (!assistantText) {
-    // Fallback if the output wasn't NDJSON
-    return { data: parseTurnJson<T>(stdout), usage: null };
-  }
-
-  return { data: parseTurnJson<T>(assistantText), usage };
+    if (child.stdin) {
+      // Guard the write: if the child dies before draining the prompt the pipe
+      // raises EPIPE, which without a handler becomes an unhandled 'error'
+      // event and takes the whole server process down.
+      child.stdin.on("error", () => {});
+      try {
+        child.stdin.write(prompt);
+        child.stdin.end();
+      } catch {
+        /* stream already destroyed */
+      }
+    }
+  });
 }
 
-function logPiProcess(proc: ChildProcess | null, label: string) {
-  if (!proc) return;
-  const startTime = Date.now();
-  let firstTokenTime: number | null = null;
+/** Map a collected run onto a result, preserving the original error surface. */
+function finalizePiRun<T>(r: PiCollectResult): { data: T; usage: unknown } {
+  if (r.spawnError) throw r.spawnError;
+  if (r.aborted) throw new Error("Pi CLI call aborted");
 
-  console.log(`\x1b[35m[Pi Telemetry] [${label}] Starting child process...\x1b[0m`);
+  if (r.exitCode !== 0) {
+    // Reproduce execFile's old reject-on-non-zero behaviour, which embedded
+    // stderr in the error message. classifyCodexError (lib/codex-errors.ts)
+    // re-derives the kind from this text, so the raw cause must stay in it.
+    const detail =
+      r.errorMessage.trim() ||
+      r.stderr.trim() ||
+      r.rawStdout.trim() ||
+      `exited with code ${r.exitCode}`;
+    throw new Error(detail);
+  }
 
-  proc.stdout?.on("data", (chunk: Buffer) => {
-    const text = chunk.toString();
-    const lines = text.split("\n").filter((l: string) => l.trim().length > 0);
+  if (r.errorMessage && !r.assistantText) {
+    throw new Error(r.errorMessage);
+  }
 
-    for (const line of lines) {
-      try {
-        const event = JSON.parse(line) as PiEvent & { content_block_delta?: unknown };
-        
-        // Log basic events
-        if (event.type) {
-          console.log(`\x1b[36m[Pi Event] [${label}] ${event.type}\x1b[0m`);
-        }
-        
-        // Track first token / time to first token
-        if (event.type === "content_block_delta" || (event.message?.content && event.type !== "message_end")) {
-          if (firstTokenTime === null) {
-            firstTokenTime = Date.now();
-            const ttft = firstTokenTime - startTime;
-            console.log(`\x1b[32m[Pi Telemetry] [${label}] Time to First Token (TTFT): ${ttft}ms\x1b[0m`);
-          }
-        }
-        
-        // If there's an error message in the event
-        if (event.errorMessage || event.message?.errorMessage) {
-          console.error(`\x1b[31m[Pi Coder ERROR] [${label}] ${event.errorMessage || event.message?.errorMessage}\x1b[0m`);
-        }
-        
-      } catch {
-        // Not JSON, log as raw text
-        console.log(`[Pi Raw stdout] [${label}] ${line}`);
-      }
-    }
-  });
+  if (!r.assistantText) {
+    // Fallback if the output wasn't NDJSON.
+    return { data: parseTurnJson<T>(r.rawStdout), usage: null };
+  }
 
-  proc.stderr?.on("data", (chunk: Buffer) => {
-    const text = chunk.toString();
-    const lines = text.split("\n").filter((l: string) => l.trim().length > 0);
-    for (const line of lines) {
-      console.error(`\x1b[33m[Pi stderr] [${label}] ${line}\x1b[0m`);
-    }
-  });
+  return { data: parseTurnJson<T>(r.assistantText), usage: r.usage };
+}
 
-  proc.on("close", (code: number) => {
-    const duration = Date.now() - startTime;
-    console.log(`\x1b[35m[Pi Telemetry] [${label}] Process exited with code ${code}. Total duration: ${duration}ms\x1b[0m`);
-  });
+async function runPiJsonMode<T>(
+  label: "runJson" | "runJsonInThread",
+  binary: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<{ data: T; usage: unknown }> {
+  try {
+    const collected = await spawnAndCollect(label, binary, args, env, prompt, signal);
+    return finalizePiRun<T>(collected);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new CodexError("generic", `Pi CLI ${label} failed: ${message}`);
+  }
 }
 
 export async function runJsonPi<T>(
@@ -282,24 +548,7 @@ export async function runJsonPi<T>(
 
   console.log(`\x1b[34m[Pi Command] Running: ${binary} ${args.join(" ")}\x1b[0m`);
 
-  try {
-    const proc = execFileAsync(binary, args, {
-      env,
-      signal: opts.signal,
-      maxBuffer: 10 * 1024 * 1024,
-    });
-
-    logPiProcess(proc.child, "runJsonPi");
-
-    proc.child.stdin?.write(augmentedPrompt);
-    proc.child.stdin?.end();
-    const { stdout } = await proc;
-    const parsed = parsePiNdjson<T>(stdout);
-    return { data: parsed.data, usage: parsed.usage };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new CodexError("generic", `Pi CLI runJson failed: ${message}`);
-  }
+  return runPiJsonMode<T>("runJson", binary, args, env, augmentedPrompt, opts.signal);
 }
 
 export async function runJsonInThreadPi<T>(args: {
@@ -345,22 +594,13 @@ export async function runJsonInThreadPi<T>(args: {
 
   console.log(`\x1b[34m[Pi Command] Running: ${binary} ${cliArgs.join(" ")}\x1b[0m`);
 
-  try {
-    const proc = execFileAsync(binary, cliArgs, {
-      env,
-      signal: args.opts?.signal,
-      maxBuffer: 10 * 1024 * 1024,
-    });
-
-    logPiProcess(proc.child, "runJsonInThreadPi");
-
-    proc.child.stdin?.write(prompt);
-    proc.child.stdin?.end();
-    const { stdout } = await proc;
-    const parsed = parsePiNdjson<T>(stdout);
-    return { data: parsed.data, usage: parsed.usage, threadId };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new CodexError("generic", `Pi CLI runJsonInThread failed: ${message}`);
-  }
+  const parsed = await runPiJsonMode<T>(
+    "runJsonInThread",
+    binary,
+    cliArgs,
+    env,
+    prompt,
+    args.opts?.signal,
+  );
+  return { data: parsed.data, usage: parsed.usage, threadId };
 }

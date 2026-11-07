@@ -19,6 +19,7 @@
     "generate-pdfs": "tsx scripts/generate-sample-pdfs.ts",
     "test:errors": "tsx scripts/test-error-handling.ts",
     "test:md": "tsx scripts/test-md-import.ts",
+    "test:pi": "tsx scripts/test-pi-stream.ts",
     "smoke": "node scripts/smoke-test.mjs",
     "smoke-all": "node scripts/full-test.mjs",
     "build-writeup": "node scripts/build-pdf.mjs",
