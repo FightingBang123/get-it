@@ -86,10 +86,21 @@ module.exports = async function afterPack(context) {
     return;
   }
 
-  // The two trees to repair, relative to project root and to appResources.
+  // The trees to repair, relative to project root and to appResources.
+  //
+  // The same nested-node_modules stripping that hits `.next/standalone/`
+  // also hits the vendored CLIs we stage under `electron/`. Pi's CLI is
+  // NOT self-contained — it ships its whole dependency tree in a nested
+  // `node_modules/` and imports it by bare specifier (e.g.
+  // `dist/core/http-dispatcher.js` does `import * as undici from
+  // "undici"`). electron-builder drops that directory because the
+  // package is a devDependency, leaving the packaged CLI to die at
+  // startup with ERR_MODULE_NOT_FOUND. Gemini is unaffected: its CLI
+  // ships a self-contained `bundle/` and has no nested node_modules.
   const repairs = [
     ".next/standalone/node_modules",
     ".next/standalone/.next/node_modules",
+    path.join("electron", "pi-bin", "pi-cli", "node_modules"),
   ];
 
   for (const rel of repairs) {
