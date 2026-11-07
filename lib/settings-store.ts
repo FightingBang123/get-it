@@ -48,6 +48,13 @@ export type AppSettings = {
   /** Appearance: explicit "light"/"dark", or "system" to follow the OS.
    *  Defaults to "light" when unset. */
   theme?: "light" | "dark" | "system";
+  /** Long-document retrieval tuning (see lib/retrieval.ts). Optional — the
+   *  defaults apply when omitted. */
+  retrieval?: {
+    maxChunks?: number;
+    maxTokens?: number;
+    historyTurns?: number;
+  };
 };
 
 const VERSION = 2 as const; // Bumped to 2 for new settings structure
@@ -163,6 +170,7 @@ export function loadSettings(): AppSettings {
           typeof parsed.piModelSmart === "string"
             ? parsed.piModelSmart
             : env.piModelSmart,
+        retrieval: parsed.retrieval,
         piProvider: piProvider as AppSettings["piProvider"],
         piApiType: piApiType as AppSettings["piApiType"],
       };

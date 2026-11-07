@@ -72,7 +72,7 @@ function docTitleFromFilename(filename: string): string {
     "calculus.pdf": "Differential & Integral Calculus",
     "chemistry.pdf": "Organic Chemistry",
   };
-  return FILENAME_TO_TITLE[filename] ?? filename.replace(/\.(pdf|md|markdown|mdown|mkd|mdwn)$/i, "");
+  return FILENAME_TO_TITLE[filename] ?? filename.replace(/\.(pdf|epub|md|markdown|mdown|mkd|mdwn)$/i, "");
 }
 
 function mergeTagsFile(
@@ -238,7 +238,11 @@ async function analyzeBatch(
 
   const richSet = new Set(rich.map((r) => r.pageIndex));
   detectionErrors.delete(docId); // Reset prior errors on fresh run
-  const result = await detectConceptsForPages(rich);
+  const result = await detectConceptsForPages(
+    rich,
+    undefined,
+    getDoc(docId)?.materialKind,
+  );
 
   // Route each concept back to its page; drop any the model mis-tagged with a
   // page outside this batch.

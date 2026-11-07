@@ -17,7 +17,7 @@ import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
  * fragments of the PDF to the model. Tunable — raise it as model context and
  * the batching pipeline allow.
  */
-export const MAX_PDF_PAGES = 150;
+export const MAX_PDF_PAGES = 400;
 
 /**
  * A page counts as "text-bearing" once it carries at least this many

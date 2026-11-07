@@ -29,6 +29,11 @@ import {
   type KGBuildResult,
   type KGEvaluateResult,
 } from "./schemas-kg";
+import { KG_SINGLE_CALL_TOKENS } from "./context-budget";
+import { loadDocChunks } from "./doc-chunks";
+import { buildGraphInParts } from "./kg-build";
+import { systemPrompt } from "../prompt/registry";
+import type { MaterialKind } from "../prompt/types";
 import {
   loadWorkContext,
   summariseForEvaluator,
@@ -37,47 +42,16 @@ import {
 
 // ── Build prompt ──────────────────────────────────────────────────────
 
-const BUILD_SYSTEM = `You are Get It.'s knowledge-graph architect.
-
-GOAL
-You receive the full text of a textbook-style PDF. Build the BEST possible
-concept graph for a learner working through this material.
-
-NODES — each node is one CONCEPT. Pick:
-  • the concepts a student would actually need to master (not minor asides)
-  • a useful granularity: not so coarse that two distinct ideas share a node,
-    not so fine that the graph turns into a glossary
-  • 6–25 nodes is the typical sweet spot. Up to 30 only if the material
-    genuinely demands it.
-  • For each node provide: a stable lowercase-kebab id (\`circulatory-system\`),
-    a short human label in the SOURCE LANGUAGE, a 1–2 sentence summary, and
-    the page numbers (1-indexed) where the concept is treated.
-
-EDGES — directed from source -> target — capture HOW concepts connect:
-  • prerequisite ("you need X before Y" → Y depends on X, so source=X, target=Y)
-  • composition / part-of
-  • causal ("X causes Y")
-  • specialisation ("X is a kind of Y")
-  • parallel / contrast (use sparingly)
-  Use the "relation" field to phrase the link in one short clause, in the
-  source language. Skip trivial or duplicate edges.
-
-GLOBAL NOTE — one short paragraph the student will read first: what this
-document is about, what the spine of the learning path is, and where the
-hardest / most central concepts are. SOURCE LANGUAGE.
-
-LANGUAGE: detect the source language and write every label, summary,
-relation, and the global note in that language. ids stay lowercase-kebab
-(ASCII).
-
-Return ONE JSON object matching the schema. No prose.`;
-
-function buildPrompt(filename: string, pageBlobs: string[]): string {
+function buildPrompt(
+  filename: string,
+  pageBlobs: string[],
+  kind: MaterialKind = "default",
+): string {
   const text = pageBlobs.join("\n\n");
   // Stable instruction prefix first, variable document body last — keeps the
   // prompt prefix-cacheable and lets the model anchor on the rubric before it
   // reads the source.
-  return `${BUILD_SYSTEM}
+  return `${systemPrompt("kg-build", kind)}
 
 --- DOCUMENT (filename: ${filename}) ---
 ${text}
@@ -85,11 +59,10 @@ ${text}
 }
 
 /**
- * Pack every page in full — no per-page or total character cap. The upload
- * gate (MAX_PDF_PAGES) is what bounds document size now; truncating here would
- * mean the graph silently ignores later chapters, which is exactly the
- * long-document failure we're fixing. The whole text goes to the model so the
- * concept graph covers the document end to end.
+ * Join every page for the single-call path. Only used when the whole document
+ * fits inside `KG_SINGLE_CALL_TOKENS`; longer documents go through the
+ * chunked map-reduce in lib/kg-build.ts so no request ever carries the whole
+ * book.
  */
 function packPages(pages: { pageIndex: number; text: string }[]): string[] {
   return pages
@@ -133,11 +106,35 @@ async function startBuild(docId: string): Promise<KnowledgeGraph> {
   saveKG(placeholder);
 
   try {
-    const blobs = packPages(doc.extracted.pages);
-    const prompt = buildPrompt(doc.filename, blobs);
-    const { data } = await runJson<KGBuildResult>(prompt, kgBuildSchema, {
-      reasoning: "medium",
-    });
+    const chunks = loadDocChunks(docId, doc.extracted.pages);
+    const totalTokens = chunks.reduce((sum, chunk) => sum + chunk.tokens, 0);
+
+    const data =
+      totalTokens <= KG_SINGLE_CALL_TOKENS
+        ? (
+            await runJson<KGBuildResult>(
+              buildPrompt(
+                doc.filename,
+                packPages(doc.extracted.pages),
+                doc.materialKind,
+              ),
+              kgBuildSchema,
+              { reasoning: "medium" },
+            )
+          ).data
+        : await buildGraphInParts(
+            {
+              filename: doc.filename,
+              chunks,
+              materialKind: doc.materialKind,
+            },
+            async <T>(prompt: string, schema: object): Promise<T> => {
+              const result = await runJson<T>(prompt, schema, {
+                reasoning: "medium",
+              });
+              return result.data;
+            },
+          );
 
     const ids = new Set(data.nodes.map((n) => n.id));
     const cleanEdges = data.edges.filter(
@@ -186,73 +183,12 @@ async function startBuild(docId: string): Promise<KnowledgeGraph> {
 
 // ── Evaluation ────────────────────────────────────────────────────────
 
-const EVALUATE_SYSTEM = `You are Get It.'s evaluator agent. You score how
-well a student has mastered each concept in a knowledge graph based on
-their actual interactions with four learning tools (chat, flashcards,
-quizzes, Feynman).
 
-You must score, per concept, four 0–100 parameters:
-
-  MEMORY — does the student RECALL the concept?
-    • Use flashcard self-ratings (1=again, 4=easy), quiz correctness on
-      definitional / fact-recall questions, recall in chat, references
-      across days. Recall over time > recall in the moment.
-
-  COMPREHENSION — does the student understand it in their OWN WORDS?
-    • Look at chat paraphrases, Feynman explanations. Verbatim repetition
-      of the source = low. Original metaphors / lay-language re-explanations
-      that match the substance = high. The Feynman "explain it to a child"
-      step is the strongest signal here. A correct quiz answer where the
-      student would have been fooled by a plausible distractor is also a
-      comprehension signal — it shows they can tell siblings apart, not
-      just recognise the right word.
-
-  STRUCTURE — does the student grasp how this concept CONNECTS to others?
-    • Look for cause-effect chains, references to prerequisites, comparisons
-      with sibling concepts. Isolated factoids = low. Multi-step reasoning
-      that bridges concepts = high. Quizzes that pit a concept against its
-      sibling and the student picks the right one are mild structure
-      evidence.
-
-  APPLICATION — does the student TRANSFER the concept to new cases?
-    • Look for original examples, edge cases the student invented, problem
-      solving on novel scenarios. Solving textbook-clone problems alone =
-      moderate. Spontaneously generating new cases = high. Quiz questions
-      that pose a fresh scenario (not a definition) and the student answers
-      correctly are real application evidence.
-
-HOW THE INPUT IS FRAMED
-You are given each concept's CURRENT four scores (the baseline, in parens) and
-ONLY the interactions that happened SINCE the last evaluation. The baseline
-already encodes everything the student proved earlier, so you never need the
-older transcript — just decide, from the new evidence, where a score should
-rise. Treat the current scores as the floor.
-
-CRITICAL RULES
-1. Scores are MONOTONE NON-DECREASING across evaluations — a student can
-   only progress, never regress. Engine-side we will clamp any decrease,
-   so your job is to NEVER decrease, only raise scores when there is fresh
-   evidence. A concept with no new evidence keeps its current score.
-2. Be RIGOROUS. Quantity of interactions does NOT entitle a high score —
-   only quality of evidence does. A student who has done 50 flashcards but
-   rates them all "again", or who has scored 1/8 on every quiz, should sit
-   very low on memory; a student who has given a single brilliant Feynman
-   explanation can earn a strong jump on comprehension for that concept.
-3. Only emit updates for concepts that have observable evidence in the
-   work context. Concepts with no evidence are silently kept at 0 / their
-   previous level.
-4. evaluatorNote per concept: one or two short sentences in the source
-   language saying what to focus on next for this concept. Empty if
-   nothing to add yet.
-5. globalNote: one paragraph in the source language summarising overall
-   state and the single most leveraged next move (e.g. "Reinforce the
-   structure dimension on X — comprehension is solid but you haven't
-   connected it to Y yet").
-
-OUTPUT
-Single JSON object matching the schema. No prose.`;
-
-function evaluatePrompt(kg: KnowledgeGraph, workCtxText: string): string {
+function evaluatePrompt(
+  kg: KnowledgeGraph,
+  workCtxText: string,
+  kind: MaterialKind = "default",
+): string {
   const kgSummary = kg.nodes
     .map(
       (n) =>
@@ -264,7 +200,7 @@ function evaluatePrompt(kg: KnowledgeGraph, workCtxText: string): string {
       .slice(0, 80)
       .map((e) => `${e.source} -[${e.relation}]-> ${e.target}`)
       .join("\n") || "(no edges)";
-  return `${EVALUATE_SYSTEM}
+  return `${systemPrompt("kg-evaluate", kind)}
 
 --- KNOWLEDGE GRAPH (current scores in parens) ---
 ${kgSummary}
@@ -341,7 +277,11 @@ async function runEvaluation(docId: string): Promise<void> {
   const sinceTs = kg.lastEvaluatedAt;
   if (!hasInteractionsSince(workCtx, sinceTs)) return;
 
-  const promptText = evaluatePrompt(kg, summariseForEvaluator(workCtx, sinceTs));
+  const promptText = evaluatePrompt(
+    kg,
+    summariseForEvaluator(workCtx, sinceTs),
+    getDoc(docId)?.materialKind,
+  );
   const { data } = await runJson<KGEvaluateResult>(promptText, kgEvaluateSchema, {
     reasoning: "medium",
   });

@@ -24,48 +24,42 @@ import {
 } from "@/lib/work-context";
 import { chatReplySchema, type ChatReplyResult } from "@/lib/schemas-kg";
 import { loadKG } from "@/lib/kg";
+import { buildDocumentContext } from "@/lib/retrieval";
+import { systemPrompt } from "@/prompt/registry";
 import type { ProviderName } from "@/lib/provider-types";
 
 export const runtime = "nodejs";
 export const maxDuration = 180;
 
-const SYSTEM = `You are Get It.'s study companion for one specific document.
-
-You answer the student's questions about the document accurately and
-concisely. You teach with care:
-
-  • If the student is missing a prerequisite, give a 1-line bridge before
-    answering.
-  • Use plain language; introduce technical terms only when the source did.
-  • When the source contradicts a common misconception, name the
-    misconception explicitly.
-  • Cite page numbers from the document when you reference specific facts.
-  • Encourage the student to explain things back to you when their question
-    suggests confusion.
-
-LANGUAGE: reply in the same language as the student's most recent message.
-If unsure, default to the document's language.
-
-KEEP IT TIGHT: 2–8 short paragraphs is usually plenty. No filler. No
-repeating the question.`;
-
-function docContext(docId: string): string {
+function docContext(
+  docId: string,
+  message: string,
+  history: ChatMessage[],
+): { text: string; mode: "full" | "relevance" | "coverage" } {
   const doc = getDoc(docId);
-  if (!doc) return "";
+  if (!doc) return { text: "", mode: "full" };
   const kg = loadKG(docId);
   const kgPart = kg && kg.status === "ready"
     ? `\nKEY CONCEPTS (knowledge graph):\n${kg.nodes
         .map((n) => `- ${n.label}: ${n.summary}`)
         .join("\n")}\n`
     : "";
-  // Full document text — no excerpt cap. Upload caps the document at
-  // MAX_PDF_PAGES, and the conversation runs on a persistent Codex thread, so
-  // this whole block is sent ONCE on the first turn and reused (cached) for
-  // every later turn rather than re-sent each message.
-  const fullText = doc.extracted.pages
-    .map((p) => `[page ${p.pageIndex + 1}]\n${p.text}`)
-    .join("\n\n");
-  return `DOCUMENT: ${doc.filename}\n${kgPart}\nDOCUMENT TEXT:\n${fullText}`;
+  // Short documents go to the model whole (the persistent thread caches the
+  // block across turns). Long ones are narrowed to the pages relevant to this
+  // message, otherwise the thread exceeds the model's context on the first
+  // turn — which is what used to break long books.
+  const context = buildDocumentContext({
+    docId,
+    pages: doc.extracted.pages,
+    kg,
+    tool: "chat",
+    message,
+    history: history.map((m) => ({ role: m.role, content: m.content })),
+  });
+  return {
+    text: `DOCUMENT: ${doc.filename}\n${kgPart}\n${context.text}`,
+    mode: context.mode,
+  };
 }
 
 function renderHistory(messages: ChatMessage[]): string {
@@ -129,9 +123,16 @@ export async function POST(
     // it.
     const messagesForPrompt = [...chat.messages, userMsg];
 
-    // The new turn the student just typed — all that needs to go over the
-    // wire when resuming an existing Codex thread.
-    const turnInput = `STUDENT: ${message}\n\n--- ASSISTANT REPLY ---\nReply now as ASSISTANT. Output JSON.`;
+    // Document context for this turn. Short docs are the whole document; long
+    // docs are the handful of chunks relevant to this message.
+    const docCtx = docContext(docId, message, messagesForPrompt);
+
+    // The new turn the student just typed. When the document is excerpted we
+    // re-send the matching excerpts on every turn — a resumed thread only
+    // knows the pages it was seeded with, which may not cover this question.
+    const turnBody = `STUDENT: ${message}\n\n--- ASSISTANT REPLY ---\nReply now as ASSISTANT. Output JSON.`;
+    const turnInput =
+      docCtx.mode === "full" ? turnBody : `${docCtx.text}\n\n${turnBody}`;
 
     const activeProvider = getActiveProviderName();
     let reply: ChatReplyResult | null = null;
@@ -170,7 +171,8 @@ export async function POST(
     // document + the conversation so far. Stable prefix first, latest turn last.
     // This is the transparent migration: the new engine sees the entire history.
     if (!reply) {
-      const fullInput = `${SYSTEM}\n\n${docContext(docId)}\n\n--- CONVERSATION SO FAR ---\n${renderHistory(
+      const systemText = systemPrompt("chat", getDoc(docId)?.materialKind);
+      const fullInput = `${systemText}\n\n${docCtx.text}\n\n--- CONVERSATION SO FAR ---\n${renderHistory(
         messagesForPrompt,
       )}\n\n--- ASSISTANT REPLY ---\nReply now as ASSISTANT. Output JSON.`;
       const { data, threadId } = await runJsonInThread<ChatReplyResult>({

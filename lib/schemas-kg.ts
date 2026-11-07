@@ -5,6 +5,35 @@
 
 // ── Knowledge graph: build (one-shot, runs at upload) ─────────────────
 
+/** One concept node. Shared by the single-call and map-phase schemas. */
+const kgNodeSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id", "label", "summary", "pageHints"],
+  properties: {
+    id: { type: "string", minLength: 2, maxLength: 60 },
+    label: { type: "string", minLength: 2, maxLength: 80 },
+    summary: { type: "string", minLength: 10, maxLength: 280 },
+    pageHints: {
+      type: "array",
+      maxItems: 12,
+      items: { type: "integer", minimum: 1 },
+    },
+  },
+} as const;
+
+/** One directed relation. Shared by the single-call and map-phase schemas. */
+const kgEdgeSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["source", "target", "relation"],
+  properties: {
+    source: { type: "string", minLength: 2, maxLength: 60 },
+    target: { type: "string", minLength: 2, maxLength: 60 },
+    relation: { type: "string", minLength: 2, maxLength: 80 },
+  },
+} as const;
+
 export const kgBuildSchema = {
   type: "object",
   additionalProperties: false,
@@ -14,39 +43,43 @@ export const kgBuildSchema = {
       type: "array",
       minItems: 4,
       maxItems: 30,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["id", "label", "summary", "pageHints"],
-        properties: {
-          id: { type: "string", minLength: 2, maxLength: 60 },
-          label: { type: "string", minLength: 2, maxLength: 80 },
-          summary: { type: "string", minLength: 10, maxLength: 280 },
-          pageHints: {
-            type: "array",
-            maxItems: 12,
-            items: { type: "integer", minimum: 1 },
-          },
-        },
-      },
+      items: kgNodeSchema,
     },
     edges: {
       type: "array",
       maxItems: 80,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["source", "target", "relation"],
-        properties: {
-          source: { type: "string", minLength: 2, maxLength: 60 },
-          target: { type: "string", minLength: 2, maxLength: 60 },
-          relation: { type: "string", minLength: 2, maxLength: 80 },
-        },
-      },
+      items: kgEdgeSchema,
     },
     globalNote: { type: "string", minLength: 10, maxLength: 600 },
   },
 } as const;
+
+/**
+ * Map phase for long documents: candidate concepts + relations from ONE
+ * chunk, with no global note (that is the reduce phase's job).
+ */
+export const kgMapSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["nodes", "edges"],
+  properties: {
+    nodes: {
+      type: "array",
+      maxItems: 16,
+      items: kgNodeSchema,
+    },
+    edges: {
+      type: "array",
+      maxItems: 30,
+      items: kgEdgeSchema,
+    },
+  },
+} as const;
+
+export type KGMapResult = {
+  nodes: Array<{ id: string; label: string; summary: string; pageHints: number[] }>;
+  edges: Array<{ source: string; target: string; relation: string }>;
+};
 
 export type KGBuildResult = {
   nodes: Array<{ id: string; label: string; summary: string; pageHints: number[] }>;

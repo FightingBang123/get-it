@@ -31,29 +31,11 @@ import {
 } from "@/lib/schemas-kg";
 import { loadKG } from "@/lib/kg";
 import { scheduleEvaluation } from "@/lib/kg-runner";
+import { buildDocumentContext } from "@/lib/retrieval";
+import { systemPrompt } from "@/prompt/registry";
 
 export const runtime = "nodejs";
 export const maxDuration = 180;
-
-const SYSTEM = `You are Get It.'s flashcard generator.
-
-Goal: produce a focused deck (4–10 cards) for the requested topic that
-forces ACTIVE recall and discriminates strong understanding from
-memorisation.
-
-CARD QUALITY
-  • Atomic: ONE fact / mechanism per card.
-  • Question first, then a tight answer (1–3 sentences max). No multiple-
-    choice, no "list all". Force the student to produce the answer.
-  • Mix tiers: ~30% definitions / vocabulary, ~40% mechanism / why-does-
-    this-happen, ~30% applied (small problems, edge cases).
-  • Avoid trick questions; avoid yes/no questions; avoid cards solved by
-    pattern-matching surface words.
-  • If the source is in Italian / Spanish / etc., write the cards in that
-    language.
-
-OUTPUT
-A JSON object matching the schema. No prose.`;
 
 function generationPrompt(docId: string, topic: string): string {
   const doc = getDoc(docId)!;
@@ -62,18 +44,20 @@ function generationPrompt(docId: string, topic: string): string {
     kg && kg.status === "ready"
       ? `\nKEY CONCEPTS:\n${kg.nodes.map((n) => `- ${n.label}: ${n.summary}`).join("\n")}\n`
       : "";
-  // Full document text — no excerpt cap (upload bounds size at MAX_PDF_PAGES).
-  // Stable blocks first (instructions, document, concepts), the variable TOPIC
-  // last so repeated generations on the same doc share a cacheable prefix.
-  const fullText = doc.extracted.pages
-    .map((p) => `[page ${p.pageIndex + 1}]\n${p.text}`)
-    .join("\n\n");
-  return `${SYSTEM}
+  // Short documents come back whole; long ones are narrowed to the chunks
+  // that match the topic so the request stays inside the input budget.
+  const context = buildDocumentContext({
+    docId,
+    pages: doc.extracted.pages,
+    kg,
+    tool: "flashcards",
+    topic,
+  });
+  return `${systemPrompt("flashcards", doc.materialKind)}
 
 DOCUMENT: ${doc.filename}
 ${kgPart}
-DOCUMENT TEXT:
-${fullText}
+${context.text}
 
 TOPIC: ${topic === "all" ? "the whole document — broad coverage" : topic}
 

@@ -32,6 +32,8 @@ export type DocMeta = {
   filename: string;
   uploadedAt: number;
   numPages: number;
+  /** Detected at import (lib/material-kind.ts); drives prompt selection. */
+  materialKind?: import("../prompt/types").MaterialKind;
   /** Epoch ms — last time the doc was opened in the viewer. Null until
    *  the user first opens it. Updated via `touchDoc(id)` (called from
    *  POST /api/doc/[id]/touch). */
@@ -104,6 +106,7 @@ export function saveDoc(entry: StoreEntry): void {
     filename: entry.filename,
     uploadedAt: entry.uploadedAt,
     numPages: entry.numPages,
+    materialKind: entry.materialKind,
   };
   const writeAtomic = (p: string, data: unknown) => {
     const tmp = `${path.dirname(p)}/${randomUUID()}.tmp`;

@@ -30,14 +30,19 @@ import {
   MarkdownEmptyError,
   MarkdownTooLargeError,
 } from "@/lib/md-to-pdf";
+import { epubToPdf, EpubImportError } from "@/lib/epub-to-pdf";
 import { ensureDocDir, pdfPath } from "@/lib/paths";
 import { getDoc, newDocId, saveDoc } from "@/lib/store";
+import { detectMaterialKind } from "@/lib/material-kind";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
 /** Extensions we accept as Markdown and render to PDF before ingesting. */
 const MARKDOWN_EXT = /\.(md|markdown|mdown|mkd|mdwn)$/i;
+
+/** EPUB books are unzipped, converted to Markdown and rendered to PDF. */
+const EPUB_EXT = /\.epub$/i;
 
 const SAMPLE_NAME_TO_DOC_ID: Record<string, string> = {
   anatomy: "sample-anatomy",
@@ -52,7 +57,7 @@ const SAMPLE_NAME_TO_DOC_ID: Record<string, string> = {
 function rejectionMessage(reason: PdfRejectReason, stats?: PdfQualityStats): string {
   switch (reason) {
     case "too_many_pages":
-      return `This document has ${stats?.numPages ?? "too many"} pages. Get It. supports PDFs up to ${MAX_PDF_PAGES} pages — try a single chapter or a shorter export.`;
+      return `This document has ${stats?.numPages ?? "too many"} pages. Get It. supports documents up to ${MAX_PDF_PAGES} pages — try a single chapter or a shorter export.`;
     case "no_text":
       return "This PDF has almost no selectable text. Get It. reads the text layer of a document, not pictures of pages — this looks like a scan or an image-only export. Try a digital, text-based PDF (one where you can select the text in a reader).";
     case "image_dominant":
@@ -131,6 +136,23 @@ export async function POST(req: Request) {
           );
         }
       }
+
+      // EPUB uploads: unzip, walk the spine, render text + figures to PDF, then
+      // fall through to the exact same pipeline as any other upload. Every
+      // failure below is a 422 with user-facing copy from the converter.
+      if (EPUB_EXT.test(filename)) {
+        try {
+          buffer = await epubToPdf(buffer);
+        } catch (e) {
+          if (e instanceof EpubImportError) {
+            return NextResponse.json({ error: e.message, code: e.code }, { status: 422 });
+          }
+          return NextResponse.json(
+            { error: "This EPUB file couldn't be converted to a document." },
+            { status: 422 },
+          );
+        }
+      }
     }
   } else {
     return NextResponse.json({ error: "expected multipart/form-data" }, { status: 400 });
@@ -179,6 +201,9 @@ export async function POST(req: Request) {
     filename,
     uploadedAt: Date.now(),
     numPages: extracted.numPages,
+    // Empty, cheap, and stored with the doc so every later prompt can be
+    // tailored to the genre without re-analysing the text.
+    materialKind: detectMaterialKind(extracted.pages),
     extracted,
     pdfUrl,
   });

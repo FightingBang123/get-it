@@ -107,6 +107,13 @@ export function tagsPath(docId: string): string {
   return path.join(docDir(docId), "tags.json");
 }
 
+/** Cached page-chunk index used to keep every model call within its input
+ *  budget (see lib/doc-chunks.ts). */
+export function chunksPath(docId: string): string {
+  assertValidDocId(docId);
+  return path.join(docDir(docId), "chunks.json");
+}
+
 export function ensureDocDir(docId: string): void {
   assertValidDocId(docId);
   fs.mkdirSync(docDir(docId), { recursive: true });
