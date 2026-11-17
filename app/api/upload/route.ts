@@ -117,7 +117,21 @@ export async function POST(req: Request) {
       }
       buffer = Buffer.from(await file.arrayBuffer());
       const fname = (file as unknown as { name?: string }).name;
-      if (fname) filename = fname.replace(/[^a-z0-9._-]/gi, "_");
+      if (fname) {
+        // Keep the human-facing name readable: this `filename` is only stored as
+        // display metadata — every on-disk path is keyed by docId (lib/paths.ts)
+        // — so we must NOT strip non-ASCII. Otherwise a file like 「三体.pdf」
+        // would render as three underscores everywhere. We drop only the
+        // characters that would be hazardous or awkward to keep around
+        // (path separators, Windows-reserved characters, control bytes); spaces
+        // and any Unicode letter/number survive untouched.
+        filename = fname
+          .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+          .replace(/^[_ -]+|[_ -]+$/g, "")
+          .trim();
+        // Everything removed / pathologically empty → give it a stable fallback.
+        if (!filename || !filename.includes(".")) filename = "uploaded.pdf";
+      }
 
       // Markdown uploads: render to a clean, text-bearing PDF up front, then
       // fall through to the exact same extract → gate → store pipeline as any
